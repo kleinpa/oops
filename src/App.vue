@@ -1,291 +1,282 @@
-<script setup>
-import { ref, onMounted, nextTick } from 'vue';
+<script setup lang="ts">
+import { ref, onMounted, onBeforeUnmount } from 'vue';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
+import { marked } from 'marked';
 
-// --- Reactive State ---
-const worker = ref(null);
-const userInput = ref('');
-const messages = ref([]);
-const chatWindow = ref(null);
-const isLoading = ref(true); // Now tracks both loading and generating
-const loadingStatus = ref('Initializing worker...');
-const progress = ref(0); // For the progress bar
+// --- Type Definitions ---
+interface WorkerProgress {
+  status: string;
+  progress: number;
+}
 
-// --- Lifecycle Hook ---
+// --- Xterm.js and State ---
+const terminalEl = ref<HTMLElement | null>(null);
+let term: Terminal;
+let fitAddon: FitAddon;
+let currentLine = '';
+let lastShownProgress = 0;
+
+const currentBotResponse = ref<string>('');
+const completedBotResponses = ref<string[]>([]); // Stores full text of completed bot responses
+const worker = ref<Worker | null>(null);
+const isLoading = ref<boolean>(true);
+const isModelLoading = ref<boolean>(true);
+const loadingStatus = ref<string>('Initializing...');
+const progress = ref<number>(0);
+const modelName = ref<string>(''); // To store the model name
+
+// --- Lifecycle Hooks for Xterm.js ---
 onMounted(() => {
-  // Create the Web Worker
-  worker.value = new Worker(new URL('./worker.js', import.meta.url), {
-    type: 'module',
+  if (!terminalEl.value) return;
+
+  term = new Terminal({
+    cursorBlink: true,
+    fontFamily: "'Consolas', 'Monaco', 'Courier New', monospace",
+    fontSize: 16,
+    theme: {
+      background: '#0d0d0d',
+      foreground: '#e0e0e0',
+      cursor: '#00ff41',
+    },
+    convertEol: true,
+  });
+  fitAddon = new FitAddon();
+  term.loadAddon(fitAddon);
+
+  term.open(terminalEl.value);
+  fitAddon.fit();
+  window.addEventListener('resize', () => fitAddon.fit());
+
+  term.onKey(({ key, domEvent }) => {
+    if (domEvent.ctrlKey && domEvent.key === 'c') {
+      if (isLoading.value && !isModelLoading.value) {
+        domEvent.preventDefault();
+        stopGeneration();
+        term.write('^C');
+        writePrompt();
+      }
+      return;
+    }
+    if (isLoading.value) return;
+    const printable = !domEvent.altKey && !domEvent.ctrlKey && !domEvent.metaKey;
+
+    if (domEvent.key === 'Enter') {
+      if (currentLine) {
+        term.write('\r\n');
+        sendMessage(currentLine);
+        currentLine = '';
+      }
+    } else if (domEvent.key === 'Backspace') {
+      if (currentLine.length > 0) {
+        term.write('\b \b');
+        currentLine = currentLine.slice(0, -1);
+      }
+    } else if (printable) {
+      term.write(key);
+      currentLine += key;
+    }
   });
 
-  // Listen for messages from the worker
+  worker.value = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
   worker.value.onmessage = handleWorkerMessage;
-
-  // Tell the worker to start loading the model
   worker.value.postMessage({ type: 'load' });
 });
 
-// --- Worker Communication ---
-function handleWorkerMessage(event) {
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', () => fitAddon.fit());
+  term?.dispose();
+});
+
+// --- Terminal Writing Functions ---
+const PROMPT = '\r\n\x1b[1;32m> \x1b[0m';
+const writeSystemMessage = (text: string) => {
+  term.writeln(`\x1b[90m${text}\x1b[0m`);
+};
+const writeBotMessage = (text: string) => {
+  term.write(text.replace(/\n/g, '\r\n'));
+};
+const writePrompt = () => {
+  currentLine = '';
+  term.write(PROMPT);
+};
+
+// --- Worker & Message Handling ---
+function handleWorkerMessage(event: MessageEvent): void {
   const { type, payload } = event.data;
 
   switch (type) {
+    case 'system_message':
+      writeSystemMessage(payload as string);
+      break;
     case 'load_start':
       isLoading.value = true;
-      loadingStatus.value = 'Loading model...';
+      isModelLoading.value = true;
+      loadingStatus.value = 'DOWNLOADING';
       break;
     case 'load_progress':
-      progress.value = Math.round(payload.progress);
-      loadingStatus.value = `${payload.status} (${progress.value}%)`;
+      const p = payload as WorkerProgress;
+      const newProgress = Math.round(p.progress);
+
+      if (newProgress > lastShownProgress) {
+        progress.value = newProgress;
+        lastShownProgress = newProgress;
+      }
+      loadingStatus.value = p.status.toUpperCase();
       break;
     case 'load_complete':
+      const { modelName: loadedModelName } = payload as { modelName: string };
+      modelName.value = loadedModelName;
+      progress.value = 100;
       isLoading.value = false;
-      loadingStatus.value = 'Model loaded. Ready to chat!';
-      messages.value.push({
-        author: 'bot',
-        text: "I'm Phi-3, running in the background. How can I help?",
-      });
+      isModelLoading.value = false;
+      loadingStatus.value = 'READY';
+      writePrompt();
+      break;
+    case 'load_error':
+      isLoading.value = false;
+      isModelLoading.value = false;
+      loadingStatus.value = 'ERROR';
+      writeSystemMessage(`Error details: ${payload}`);
       break;
     case 'generation_stream':
-      // Append the streamed token to the last bot message
-      const lastMessage = messages.value[messages.value.length - 1];
-      lastMessage.text = (lastMessage.text === '...') ? payload : lastMessage.text + payload;
-      scrollToBottom();
+      const token = payload as string;
+      writeBotMessage(token);
+      currentBotResponse.value += token;
+      applyGeneratedCss([...completedBotResponses.value, currentBotResponse.value]);
       break;
     case 'generation_complete':
+      completedBotResponses.value.push(currentBotResponse.value);
+      applyGeneratedCss(completedBotResponses.value);
       isLoading.value = false;
-      loadingStatus.value = 'Ready to chat!';
+      loadingStatus.value = 'READY';
+      writePrompt();
       break;
   }
 }
 
-// --- UI Logic ---
-const sendMessage = () => {
-  if (!userInput.value.trim() || isLoading.value) return;
+// --- CSS Application (now operates on an array of responses) ---
+function applyGeneratedCss(responses: string[]): void {
+  let allCss = '';
 
-  const userMessage = userInput.value;
-  messages.value.push({ author: 'user', text: userMessage });
-  userInput.value = '';
-  messages.value.push({ author: 'bot', text: '...' });
-  scrollToBottom();
+  for (const responseText of responses) {
+    const tokens = marked.lexer(responseText);
+    for (const token of tokens) {
+      if (token.type === 'code' && token.lang === 'css') {
+        allCss += token.text + '\n';
+      }
+    }
+  }
 
+  const styleId = 'chatbot-generated-styles';
+  let styleElement = document.getElementById(styleId) as HTMLStyleElement;
+  if (!styleElement) {
+    styleElement = document.createElement('style');
+    styleElement.id = styleId;
+    document.head.appendChild(styleElement);
+  }
+  styleElement.innerHTML = allCss;
+}
+
+const sendMessage = (text: string): void => {
+  if (isLoading.value) return;
+  currentBotResponse.value = '';
   isLoading.value = true;
-  loadingStatus.value = 'Generating response...';
+  loadingStatus.value = 'GENERATING';
 
-  // Prepare messages and send to the worker
-  const formattedMessages = messages.value.slice(0, -1).map(msg => ({
-    role: msg.author === 'user' ? 'user' : 'assistant',
-    content: msg.text,
-  }));
-  worker.value.postMessage({ type: 'generate', payload: { messages: formattedMessages } });
+  worker.value?.postMessage({
+    type: 'generate',
+    payload: { userText: text }
+  });
 };
 
-const stopGeneration = () => {
+const stopGeneration = (): void => {
   if (worker.value) {
     worker.value.postMessage({ type: 'stop' });
+    completedBotResponses.value.push(currentBotResponse.value);
+    applyGeneratedCss(completedBotResponses.value);
+    isLoading.value = false;
+    loadingStatus.value = 'READY';
   }
-};
-
-const scrollToBottom = () => {
-  nextTick(() => {
-    chatWindow.value.scrollTop = chatWindow.value.scrollHeight;
-  });
 };
 </script>
 
 <template>
-  <div id="chatbot-container">
-    <div class="header">
-      <h2>Non-Blocking Phi-3 Chatbot 🚀</h2>
-      <p>Powered by Vue.js & Web Workers</p>
-    </div>
-
-    <div class="chat-window" ref="chatWindow">
-      <div v-for="(message, index) in messages" :key="index" :class="['message', message.author]">
-        <p v-html="message.text.replace(/\n/g, '<br>')"></p>
-      </div>
-    </div>
-
-    <div class="status-bar" v-if="isLoading">
-      <p>{{ loadingStatus }}</p>
-      <div v-if="loadingStatus.includes('Loading')" class="progress-bar-container">
-        <div class="progress-bar" :style="{ width: progress + '%' }"></div>
-      </div>
-      <button v-if="loadingStatus.includes('Generating')" @click="stopGeneration" class="stop-button">
-        Stop
-      </button>
-    </div>
-
-    <div class="input-area">
-      <input v-model="userInput" @keyup.enter="sendMessage" placeholder="Type your message..." :disabled="isLoading" />
-      <button @click="sendMessage" :disabled="isLoading">Send</button>
+  <div id="terminal-container">
+    <div ref="terminalEl" class="terminal-view"></div>
+    <div class="status-line">
+      <span class="status-left">
+        STATUS: {{ loadingStatus }}
+        <span v-if="isModelLoading">({{ progress }}%)</span>
+        <span v-else-if="modelName">| {{ modelName }}</span>
+      </span>
+      <span class="status-right">
+        <a href="https://github.com/kleinpa/oops" target="_blank" rel="noopener noreferrer" class="github-link">
+          kleinpa/oops
+        </a>
+        <a href="#" @click.prevent="stopGeneration" v-if="isLoading && !isModelLoading">[stop]</a>
+      </span>
     </div>
   </div>
 </template>
 
 <style>
-/* Existing styles are fine, just add styles for the progress bar and stop button */
-.progress-bar-container {
-  width: 80%;
-  height: 10px;
-  background-color: #555;
-  border-radius: 5px;
-  margin: 0.5rem auto 0;
-  overflow: hidden;
-}
-
-.progress-bar {
-  height: 100%;
-  background-color: var(--accent-color);
-  transition: width 0.2s ease-in-out;
-}
-
-.stop-button {
-  margin-top: 0.5rem;
-  padding: 0.3rem 0.8rem;
-  border: none;
-  background-color: #d9534f;
-  color: white;
-  border-radius: 15px;
-  cursor: pointer;
-}
-
-.stop-button:hover {
-  background-color: #c9302c;
-}
-
-/* All other styles remain the same */
-:root {
-  --primary-bg: #1e1e1e;
-  --secondary-bg: #2d2d2d;
-  --text-color: #e0e0e0;
-  --accent-color: #4CAF50;
-  --user-msg-bg: #005A9C;
-  --bot-msg-bg: #3a3a3a;
-}
-
+html,
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  background-color: var(--primary-bg);
-  color: var(--text-color);
+  padding: 0;
+  background-color: #0d0d0d;
+}
+
+#terminal-container {
   display: flex;
-  justify-content: center;
-  align-items: center;
+  flex-direction: column;
   height: 100vh;
 }
 
-#chatbot-container {
-  width: 90%;
-  max-width: 600px;
-  height: 90vh;
-  max-height: 800px;
-  background-color: var(--secondary-bg);
-  border-radius: 12px;
-  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
-  display: flex;
-  flex-direction: column;
+.terminal-view {
+  flex-grow: 1;
+  padding: 10px;
   overflow: hidden;
 }
 
-.header {
-  padding: 1rem;
-  background-color: #333;
-  text-align: center;
-  border-bottom: 1px solid #444;
+.terminal-view .xterm {
+  width: 100%;
+  height: 100%;
 }
 
-.header h2 {
-  margin: 0;
-  font-size: 1.2rem;
-}
-
-.header p {
-  margin: 0;
-  font-size: 0.8rem;
-  color: #aaa;
-}
-
-.chat-window {
-  flex-grow: 1;
-  padding: 1rem;
-  overflow-y: auto;
+.status-line {
+  flex-shrink: 0;
   display: flex;
-  flex-direction: column;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 10px;
+  background-color: #1a1a1a;
+  border-top: 1px solid #333;
+  color: #888;
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 0.9em;
+}
+
+.status-right {
+  display: flex;
+  align-items: center;
   gap: 1rem;
 }
 
-.message {
-  padding: 0.75rem 1rem;
-  border-radius: 18px;
-  max-width: 80%;
-  word-wrap: break-word;
-  line-height: 1.5;
+.status-line a {
+  color: #ff4757;
+  text-decoration: none;
 }
 
-.message.user {
-  background-color: var(--user-msg-bg);
-  color: white;
-  align-self: flex-end;
-  border-bottom-right-radius: 4px;
+.status-line a.github-link {
+  color: #888;
+  text-decoration: none;
 }
 
-.message.bot {
-  background-color: var(--bot-msg-bg);
-  align-self: flex-start;
-  border-bottom-left-radius: 4px;
-}
-
-.message p {
-  margin: 0;
-}
-
-.status-bar {
-  padding: 0.5rem 1rem;
-  text-align: center;
-  font-size: 0.9rem;
-  color: #ccc;
-  background-color: rgba(0, 0, 0, 0.2);
-}
-
-.input-area {
-  display: flex;
-  padding: 1rem;
-  border-top: 1px solid #444;
-}
-
-.input-area input {
-  flex-grow: 1;
-  padding: 0.75rem;
-  border: 1px solid #555;
-  border-radius: 20px;
-  background-color: #444;
-  color: var(--text-color);
-  font-size: 1rem;
-  margin-right: 0.5rem;
-}
-
-.input-area input:focus {
-  outline: none;
-  border-color: var(--accent-color);
-}
-
-.input-area button {
-  padding: 0.75rem 1.5rem;
-  border: none;
-  background-color: var(--accent-color);
-  color: white;
-  border-radius: 20px;
-  cursor: pointer;
-  font-size: 1rem;
-  transition: background-color 0.2s;
-}
-
-.input-area button:hover {
-  background-color: #45a049;
-}
-
-.input-area button:disabled {
-  background-color: #555;
-  cursor: not-allowed;
+.status-line a.github-link:hover {
+  color: #bbb;
+  text-decoration: underline;
 }
 </style>
