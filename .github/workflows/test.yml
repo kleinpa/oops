@@ -1,7 +1,11 @@
 name: test
 on:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
+      - main
       - renovate/*
   workflow_dispatch:
 jobs:
