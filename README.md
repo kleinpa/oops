@@ -1,5 +1,34 @@
-# Vue 3 + TypeScript + Vite
+# oops
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+This project is an experiment in creating a self-modifying web application, powered by in-browser machine learning models.
 
-Learn more about the recommended Project Setup and IDE Support in the [Vue Docs TypeScript Guide](https://vuejs.org/guide/typescript/overview.html#project-setup).
+It is a web application built with Vue.js, Vite, and TypeScript. It uses `@huggingface/transformers` to run machine learning models directly in the browser, `@xterm/xterm` to provide a terminal-like interface, and `marked` for Markdown rendering. The goal is to explore how an application can understand and modify its own source code using AI.
+
+## Project Setup
+
+### Prerequisites
+
+- Node.js
+- pnpm (recommended, as the project is configured for it)
+
+### Installation
+
+1.  Clone the repository.
+2.  Install the dependencies using pnpm:
+    ```bash
+    pnpm install
+    ```
+
+### Running for Development
+
+To start the local development server, run:
+```bash
+pnpm run dev
+```
+
+### Building for Production
+
+To build the application for production, run:
+```bash
+pnpm run build
+```
