@@ -2,7 +2,7 @@
   "name": "oops",
   "private": true,
   "version": "0.0.0",
-  "packageManager": "pnpm@10.18.0",
+  "packageManager": "pnpm@10.18.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
